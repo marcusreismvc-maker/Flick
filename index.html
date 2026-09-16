@@ -792,10 +792,19 @@ function onAction(action, id) {
       handleSignIn(f.get("email"), f.get("password"));
       break;
     }
+    case "sign-in": {
+      const f = formData("auth-form");
+      if (!f.get("email") || !f.get("password")) { setToast("Preencha e-mail e senha", "error"); break; }
+      handleSignIn(f.get("email"), f.get("password"));
+      break;
+    }
     case "sign-up": {
       const f = formData("auth-form");
+      if (!f.get("email") || !f.get("password")) { setToast("Preencha e-mail e senha", "error"); break; }
+      if (f.get("password").length < 8) { setToast("Senha precisa ter 8+ caracteres", "error"); break; }
       handleSignUp(f.get("email"), f.get("password"));
       break;
+    }
     }
     case "sign-out": handleSignOut(); break;
     case "create-family": {
