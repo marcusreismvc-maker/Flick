@@ -1,0 +1,928 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
+<title>Missões da Família</title>
+<meta name="theme-color" content="#0F1117" />
+<link rel="manifest" href="manifest.json" />
+<script src="https://cdn.tailwindcss.com"></script>
+<script>
+  tailwind.config = {
+    theme: {
+      extend: {
+        colors: {
+          surface: { DEFAULT: '#0F1117', raised: '#171A23', muted: '#1F2330' },
+          ink: { DEFAULT: '#F4F5F7', muted: '#A3A7B7' },
+          streak: { DEFAULT: '#FF6B35', glow: '#FF9A5A' },
+          points: { DEFAULT: '#FFC53D', glow: '#FFE08A' },
+          xp: { DEFAULT: '#7C5CFF', glow: '#A78BFA' },
+          success: '#3DDC97',
+          danger: '#FF5D5D',
+        },
+        borderRadius: { card: '20px', pill: '999px' },
+      },
+    },
+  };
+</script>
+<style>
+  body { background: #0F1117; }
+  .fade-in { animation: fadeIn .25s ease-out; }
+  @keyframes fadeIn { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: translateY(0); } }
+  .pop { animation: pop .3s cubic-bezier(.34,1.56,.64,1); }
+  @keyframes pop { from { transform: scale(.85); opacity:0; } to { transform: scale(1); opacity:1; } }
+  input, select { color: #0F1117; }
+</style>
+</head>
+<body class="bg-surface text-ink font-sans antialiased min-h-screen">
+<div id="app" class="min-h-screen pb-10"></div>
+
+<script type="module">
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import confetti from "https://esm.sh/canvas-confetti@1";
+
+// ---------------------------------------------------------------------
+// Configuração
+// ---------------------------------------------------------------------
+const SUPABASE_URL = "https://xqvpkgkuzxfxmkipylyg.supabase.co";
+const SUPABASE_KEY = "sb_publishable_AgUP6JxHxuaW1kzl2GIYVA_Mzq7CIR6";
+const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
+
+const AVATARS = ["🦸", "🐉", "🚀", "⚽", "🦄", "🎮", "🐱", "🦁", "🧚", "🦖"];
+
+// ---------------------------------------------------------------------
+// Som — sintetizado via Web Audio API (sem arquivos de terceiros)
+// ---------------------------------------------------------------------
+let audioCtx = null;
+function getCtx() {
+  if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  return audioCtx;
+}
+function tone(ctx, { freq, start, duration, type = "sine", gain = 0.15 }) {
+  const osc = ctx.createOscillator();
+  const g = ctx.createGain();
+  osc.type = type;
+  osc.frequency.value = freq;
+  osc.connect(g);
+  g.connect(ctx.destination);
+  const t0 = ctx.currentTime + start;
+  g.gain.setValueAtTime(0, t0);
+  g.gain.linearRampToValueAtTime(gain, t0 + 0.02);
+  g.gain.exponentialRampToValueAtTime(0.001, t0 + duration);
+  osc.start(t0);
+  osc.stop(t0 + duration + 0.05);
+}
+const soundRecipes = {
+  task_completed: (c) => tone(c, { freq: 660, start: 0, duration: 0.12, type: "triangle" }),
+  task_approved: (c) => {
+    tone(c, { freq: 523.25, start: 0, duration: 0.1 });
+    tone(c, { freq: 659.25, start: 0.08, duration: 0.14 });
+  },
+  level_up: (c) => [523.25, 659.25, 783.99, 1046.5].forEach((f, i) => tone(c, { freq: f, start: i * 0.09, duration: 0.18 })),
+  master_level: (c) => [523.25, 659.25, 783.99, 1046.5, 1318.5].forEach((f, i) => tone(c, { freq: f, start: i * 0.08, duration: 0.22, gain: 0.18 })),
+  reward_redeemed: (c) => [659.25, 783.99, 987.77, 1318.5].forEach((f, i) => tone(c, { freq: f, start: i * 0.07, duration: 0.2, gain: 0.16 })),
+  error: (c) => tone(c, { freq: 220, start: 0, duration: 0.18, type: "sawtooth", gain: 0.1 }),
+};
+function playSound(name) {
+  try {
+    const ctx = getCtx();
+    if (ctx.state === "suspended") ctx.resume();
+    soundRecipes[name]?.(ctx);
+  } catch (e) { /* silencioso — áudio não é crítico */ }
+}
+
+function fireConfetti(variant = "default") {
+  const base = { origin: { y: 0.7 }, zIndex: 9999 };
+  if (variant === "master") {
+    confetti({ ...base, particleCount: 120, spread: 90, colors: ["#FFC53D", "#FFE08A", "#7C5CFF"] });
+    setTimeout(() => confetti({ ...base, particleCount: 60, spread: 120, startVelocity: 45, colors: ["#FFC53D", "#FF6B35"] }), 200);
+    return;
+  }
+  if (variant === "reward") {
+    confetti({ ...base, particleCount: 90, spread: 70, colors: ["#FFC53D", "#3DDC97", "#7C5CFF"] });
+    return;
+  }
+  confetti({ ...base, particleCount: 60, spread: 60, colors: ["#FFC53D", "#7C5CFF"] });
+}
+
+// ---------------------------------------------------------------------
+// Estado
+// ---------------------------------------------------------------------
+const state = {
+  screen: "loading",
+  session: null,
+  family: null,
+  children: [],
+  selectedChildId: null,
+  tasks: [],
+  rewards: [],
+  redemptions: [],
+  notifications: [],
+  modal: null,
+  toast: null,
+  busy: false,
+};
+
+const app = document.getElementById("app");
+
+function setToast(message, kind = "info") {
+  state.toast = { message, kind };
+  render();
+  clearTimeout(setToast._t);
+  setToast._t = setTimeout(() => { state.toast = null; render(); }, 3500);
+}
+
+// ---------------------------------------------------------------------
+// Carregamento de dados
+// ---------------------------------------------------------------------
+async function loadFamilyData() {
+  const userId = state.session.user.id;
+
+  const { data: membership } = await supabase
+    .from("family_members")
+    .select("family_id")
+    .eq("user_id", userId)
+    .maybeSingle();
+
+  if (!membership) {
+    state.screen = "onboarding-family";
+    return;
+  }
+
+  const { data: family } = await supabase
+    .from("families")
+    .select("*")
+    .eq("id", membership.family_id)
+    .single();
+  state.family = family;
+
+  if (!family.pin_hash) {
+    state.screen = "onboarding-pin";
+    return;
+  }
+
+  await refreshAll();
+
+  state.children.length === 0
+    ? (state.screen = "onboarding-child")
+    : (state.screen = "entry");
+}
+
+async function refreshAll() {
+  const familyId = state.family.id;
+
+  const [{ data: children }, { data: tasks }, { data: rewards }, { data: redemptions }] = await Promise.all([
+    supabase.from("children").select("*").eq("family_id", familyId).order("created_at"),
+    supabase.from("tasks").select("*").eq("family_id", familyId).order("created_at", { ascending: false }).limit(100),
+    supabase.from("rewards").select("*").eq("family_id", familyId).eq("active", true).order("cost_points"),
+    supabase.from("reward_redemptions").select("*, rewards(name, icon), children(name)").in(
+      "child_id",
+      (state.children.length ? state.children : (children || [])).map((c) => c.id)
+    ),
+  ]);
+
+  state.children = children || [];
+  state.tasks = tasks || [];
+  state.rewards = rewards || [];
+  state.redemptions = (redemptions || []).filter((r) => r.status === "pending_fulfillment");
+
+  const { data: notifications } = await supabase
+    .from("notifications")
+    .select("*")
+    .eq("recipient_type", "parent")
+    .eq("recipient_id", state.session.user.id)
+    .order("created_at", { ascending: false })
+    .limit(20);
+  state.notifications = notifications || [];
+}
+
+function subscribeRealtime() {
+  supabase
+    .channel("notifications-parent")
+    .on(
+      "postgres_changes",
+      { event: "INSERT", schema: "public", table: "notifications", filter: `recipient_id=eq.${state.session.user.id}` },
+      (payload) => {
+        state.notifications = [payload.new, ...state.notifications];
+        render();
+      }
+    )
+    .subscribe();
+}
+
+// ---------------------------------------------------------------------
+// Ações
+// ---------------------------------------------------------------------
+async function handleSignIn(email, password) {
+  state.busy = true; render();
+  const { error } = await supabase.auth.signInWithPassword({ email, password });
+  state.busy = false;
+  if (error) return setToast("E-mail ou senha incorretos", "error");
+  await bootstrapSession();
+}
+
+async function handleSignUp(email, password) {
+  state.busy = true; render();
+  const { error } = await supabase.auth.signUp({ email, password });
+  state.busy = false;
+  if (error) return setToast(error.message, "error");
+  await bootstrapSession();
+}
+
+async function handleSignOut() {
+  await supabase.auth.signOut();
+  Object.assign(state, { session: null, family: null, children: [], tasks: [], rewards: [], redemptions: [], notifications: [], selectedChildId: null });
+  state.screen = "auth";
+  render();
+}
+
+async function handleCreateFamily(name) {
+  state.busy = true; render();
+  try {
+    const { data: whoami } = await supabase.rpc("debug_whoami");
+
+    const { data: family, error } = await supabase
+      .from("families")
+      .insert({ name })
+      .select()
+      .single();
+
+    if (error) {
+      state.busy = false;
+      console.error("create-family error:", error, "whoami:", whoami);
+      setToast(`uid:${whoami || "NULL"} | ${error.message} | code:${error.code || "?"} | ${error.details || ""} ${error.hint || ""}`, "error");
+      render();
+      return;
+    }
+
+    const { error: memberError } = await supabase
+      .from("family_members")
+      .insert({ family_id: family.id, user_id: state.session.user.id, role: "owner" });
+    state.busy = false;
+    if (memberError) {
+      setToast("member error: " + memberError.message + " | code:" + (memberError.code || "?"), "error");
+      render();
+      return;
+    }
+
+    state.family = family;
+    state.screen = "onboarding-pin";
+    render();
+  } catch (e) {
+    state.busy = false;
+    console.error("create-family exception:", e);
+    setToast("Exceção: " + (e?.message || String(e)), "error");
+    render();
+  }
+}
+
+async function handleSetPin(pin) {
+  state.busy = true; render();
+  const { error } = await supabase.rpc("set_family_pin", { p_family_id: state.family.id, p_pin: pin });
+  state.busy = false;
+  if (error) return setToast("PIN inválido — use 4 a 6 números", "error");
+  const { data: family } = await supabase.from("families").select("*").eq("id", state.family.id).single();
+  state.family = family;
+  await refreshAll();
+  subscribeRealtime();
+  state.screen = "onboarding-child";
+  render();
+}
+
+async function handleAddChild(name, avatar) {
+  state.busy = true; render();
+  const { error } = await supabase.from("children").insert({ family_id: state.family.id, name, avatar_url: avatar });
+  state.busy = false;
+  if (error) return setToast(error.message, "error");
+  await refreshAll();
+  state.screen = state.screen === "onboarding-child" ? "entry" : state.screen;
+  render();
+}
+
+async function handleCreateTask({ childId, title, icon, basePoints, dueTime }) {
+  state.busy = true; render();
+  let dueAt = null;
+  if (dueTime) {
+    const [h, m] = dueTime.split(":");
+    const d = new Date();
+    d.setHours(Number(h), Number(m), 0, 0);
+    dueAt = d.toISOString();
+  }
+  const { error } = await supabase.from("tasks").insert({
+    family_id: state.family.id,
+    child_id: childId,
+    title,
+    icon: icon || "🎯",
+    base_points: Number(basePoints),
+    late_points: Math.round(Number(basePoints) * 0.5),
+    due_at: dueAt,
+  });
+  state.busy = false;
+  if (error) return setToast(error.message, "error");
+  await refreshAll();
+  setToast("Missão criada!");
+  render();
+}
+
+async function handleCompleteTask(taskId) {
+  const { error } = await supabase.rpc("complete_task", { p_task_id: taskId });
+  if (error) return setToast("Não foi possível concluir", "error");
+  playSound("task_completed");
+  await refreshAll();
+  render();
+}
+
+async function submitApprove({ taskId, pin, approve }) {
+  state.busy = true; render();
+  const { data, error } = await supabase.rpc("approve_task", { p_task_id: taskId, p_pin: pin, p_approve: approve });
+  state.busy = false;
+  if (error) {
+    playSound("error");
+    return setToast(error.message.includes("pin") ? "PIN incorreto" : "Erro ao processar", "error");
+  }
+  state.modal = null;
+  await refreshAll();
+  if (approve) {
+    if (data.master_level) { fireConfetti("master"); playSound("master_level"); setToast("👑 MASTER LEVEL!"); }
+    else if (data.stage_up) { fireConfetti("default"); playSound("level_up"); setToast("🔥 Novo nível de streak!"); }
+    else { playSound("task_approved"); setToast(`+${data.points} ⭐ +${data.xp} XP`); }
+  } else {
+    setToast("Missão rejeitada");
+  }
+  render();
+}
+
+async function handleCreateReward({ name, icon, costPoints }) {
+  state.busy = true; render();
+  const { error } = await supabase.from("rewards").insert({
+    family_id: state.family.id, name, icon: icon || "🎁", cost_points: Number(costPoints),
+  });
+  state.busy = false;
+  if (error) return setToast(error.message, "error");
+  await refreshAll();
+  setToast("Prêmio criado!");
+  render();
+}
+
+async function handleRedeemReward(childId, rewardId) {
+  const { error } = await supabase.rpc("redeem_reward", { p_child_id: childId, p_reward_id: rewardId });
+  if (error) {
+    playSound("error");
+    return setToast(error.message === "insufficient_points" ? "Pontos insuficientes" : "Não foi possível resgatar", "error");
+  }
+  fireConfetti("reward");
+  playSound("reward_redeemed");
+  setToast("🎁 Resgatado! Aguarde seu responsável entregar.");
+  await refreshAll();
+  render();
+}
+
+async function submitFulfill({ redemptionId, pin }) {
+  state.busy = true; render();
+  const { error } = await supabase.rpc("fulfill_redemption", { p_redemption_id: redemptionId, p_pin: pin });
+  state.busy = false;
+  if (error) {
+    playSound("error");
+    return setToast("PIN incorreto", "error");
+  }
+  state.modal = null;
+  setToast("✅ Entrega confirmada!");
+  await refreshAll();
+  render();
+}
+
+// ---------------------------------------------------------------------
+// Render helpers
+// ---------------------------------------------------------------------
+function card(inner, extra = "") {
+  return `<div class="rounded-card bg-surface-raised p-5 ${extra}">${inner}</div>`;
+}
+function button(label, action, id = "", extra = "bg-xp text-white") {
+  return `<button data-action="${action}" data-id="${id}" class="rounded-card px-4 py-3 font-medium transition active:scale-95 ${extra}">${label}</button>`;
+}
+function levelFromXp(xp) { return Math.max(1, Math.floor(Math.sqrt(xp / 50)) + 1); }
+function xpForLevel(level) { return Math.pow(level - 1, 2) * 50; }
+
+function childCard(child) {
+  const level = levelFromXp(child.current_xp);
+  const nextLevelXp = xpForLevel(level + 1);
+  const currLevelXp = xpForLevel(level);
+  const progress = Math.min(100, Math.round(((child.current_xp - currLevelXp) / (nextLevelXp - currLevelXp || 1)) * 100));
+  return card(`
+    <div class="flex items-center gap-3">
+      <span class="text-4xl">${child.avatar_url || "🦸"}</span>
+      <div class="flex-1">
+        <p class="font-bold">${child.name}</p>
+        <p class="text-xs text-ink-muted">LEVEL ${level}</p>
+        <div class="mt-1 h-2 w-full rounded-pill bg-surface-muted">
+          <div class="h-2 rounded-pill bg-xp" style="width:${progress}%"></div>
+        </div>
+      </div>
+      <div class="text-right">
+        <p class="text-points font-display">⭐ ${child.current_points}</p>
+        <p class="text-streak text-sm">🔥 ${child.current_streak}d</p>
+      </div>
+    </div>
+  `);
+}
+
+function pendingApprovalRow(task) {
+  const child = state.children.find((c) => c.id === task.child_id);
+  return card(`
+    <div class="flex items-center justify-between gap-3">
+      <div>
+        <p class="font-medium">${task.icon || "🎯"} ${task.title}</p>
+        <p class="text-xs text-ink-muted">${child?.name || ""} • +${task.base_points} pts</p>
+      </div>
+      <div class="flex gap-2">
+        ${button("✅", "open-approve", task.id, "bg-success text-surface px-3")}
+        ${button("❌", "open-reject", task.id, "bg-danger text-white px-3")}
+      </div>
+    </div>
+  `, "mb-3");
+}
+
+function redemptionRow(r) {
+  return card(`
+    <div class="flex items-center justify-between gap-3">
+      <div>
+        <p class="font-medium">${r.rewards?.icon || "🎁"} ${r.rewards?.name}</p>
+        <p class="text-xs text-ink-muted">${r.children?.name} • -${r.cost_points} ⭐</p>
+      </div>
+      ${button("Marcar entregue", "open-fulfill", r.id, "bg-xp text-white text-sm")}
+    </div>
+  `, "mb-3");
+}
+
+function pinModal() {
+  if (!state.modal) return "";
+  const titles = { approve: "Aprovar missão", reject: "Rejeitar missão", fulfill: "Confirmar entrega" };
+  return `
+    <div class="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-6" data-action="close-modal">
+      <form id="pin-form" class="pop w-full max-w-xs rounded-card bg-surface-raised p-6 text-center" onsubmit="return false" data-stop>
+        <p class="mb-1 text-lg font-display">🔐 ${titles[state.modal.type]}</p>
+        <p class="mb-4 text-sm text-ink-muted">Digite o PIN do responsável</p>
+        <input name="pin" inputmode="numeric" maxlength="6" autofocus
+          class="mx-auto mb-4 w-40 rounded-card bg-white px-4 py-4 text-center text-2xl tracking-[0.4em]" placeholder="••••" />
+        <div class="flex gap-2">
+          ${button("Cancelar", "close-modal", "", "flex-1 bg-surface-muted text-ink")}
+          <button type="submit" class="flex-1 rounded-card bg-xp px-4 py-3 font-medium text-white">Confirmar</button>
+        </div>
+      </form>
+    </div>
+  `;
+}
+
+function toast() {
+  if (!state.toast) return "";
+  const kindClass = state.toast.kind === "error" ? "bg-danger" : "bg-surface-muted";
+  return `<div class="fade-in fixed bottom-6 left-1/2 z-50 -translate-x-1/2 rounded-pill ${kindClass} px-5 py-3 text-sm shadow-xl">${state.toast.message}</div>`;
+}
+
+function topBar(title, opts = {}) {
+  const bell = opts.bell
+    ? `<button data-action="toggle-notifications" class="relative rounded-full bg-surface-raised p-3">🔔
+        ${state.notifications.some((n) => !n.read) ? `<span class="absolute -right-1 -top-1 h-3 w-3 rounded-full bg-danger"></span>` : ""}
+      </button>`
+    : "";
+  return `
+    <div class="flex items-center justify-between px-5 pt-6">
+      <div>${opts.back ? button("←", opts.back, "", "bg-surface-raised px-3 py-2") : ""}</div>
+      <h1 class="font-display text-xl">${title}</h1>
+      <div class="flex items-center gap-2">${bell}${opts.signOut ? button("Sair", "sign-out", "", "bg-surface-raised text-sm px-3 py-2") : ""}</div>
+    </div>
+  `;
+}
+
+function notificationsPanel() {
+  if (!state.showNotifications) return "";
+  return `
+    <div class="fixed inset-0 z-40" data-action="close-notifications">
+      <div class="pop absolute right-4 top-20 w-72 rounded-card bg-surface-raised p-2 shadow-xl" data-stop>
+        ${
+          state.notifications.length === 0
+            ? `<p class="p-4 text-center text-sm text-ink-muted">Nenhuma notificação ainda</p>`
+            : state.notifications.map((n) => `
+                <div class="rounded-lg px-3 py-2">
+                  <p class="text-sm font-medium">${n.title}</p>
+                  <p class="text-xs text-ink-muted">${n.body || ""}</p>
+                </div>`).join("")
+        }
+      </div>
+    </div>
+  `;
+}
+
+// ---------------------------------------------------------------------
+// Telas
+// ---------------------------------------------------------------------
+function screenLoading() {
+  return `<div class="flex min-h-screen items-center justify-center text-ink-muted">Carregando...</div>`;
+}
+
+function screenAuth() {
+  return `
+    <div class="flex min-h-screen flex-col justify-center gap-6 p-6">
+      <div class="text-center">
+        <h1 class="font-display text-3xl">🎯 Missões da Família</h1>
+        <p class="mt-2 text-ink-muted">Entre ou crie sua conta de responsável</p>
+      </div>
+      <form id="auth-form" class="mx-auto flex w-full max-w-sm flex-col gap-3" onsubmit="return false">
+        <input name="email" type="email" required placeholder="E-mail" class="rounded-card bg-white px-4 py-3" />
+        <input name="password" type="password" required minlength="8" placeholder="Senha (mín. 8 caracteres)" class="rounded-card bg-white px-4 py-3" />
+        <button data-action="sign-in" class="rounded-card bg-xp px-4 py-3 font-medium text-white" ${state.busy ? "disabled" : ""}>Entrar</button>
+        <button data-action="sign-up" class="rounded-card bg-surface-raised px-4 py-3 font-medium" ${state.busy ? "disabled" : ""}>Criar conta</button>
+      </form>
+    </div>
+  `;
+}
+
+function screenOnboardingFamily() {
+  return `
+    <div class="flex min-h-screen flex-col justify-center gap-6 p-6">
+      <div class="text-center">
+        <h1 class="font-display text-2xl">Vamos criar sua família</h1>
+        <p class="mt-1 text-sm text-ink-muted">Escolha um nome — ex: "Família Silva"</p>
+      </div>
+      <form id="family-form" class="mx-auto flex w-full max-w-sm flex-col gap-3" onsubmit="return false">
+        <input name="name" required placeholder="Nome da família" class="rounded-card bg-white px-4 py-3" />
+        <button data-action="create-family" class="rounded-card bg-xp px-4 py-3 font-medium text-white" ${state.busy ? "disabled" : ""}>Continuar</button>
+      </form>
+      <div class="mx-auto w-full max-w-sm rounded-card bg-surface-raised p-4 text-xs text-ink-muted">
+        <p>🔧 Diagnóstico temporário</p>
+        <p>session.user.id: ${state.session?.user?.id || "NENHUM"}</p>
+        <p>session.user.email: ${state.session?.user?.email || "NENHUM"}</p>
+        ${button("Testar auth.uid() no servidor", "debug-whoami", "", "mt-2 bg-surface-muted text-ink text-xs w-full py-2")}
+        ${button("Testar INSERT direto (RPC)", "debug-test-insert", "", "mt-2 bg-surface-muted text-ink text-xs w-full py-2")}
+        ${button("Ver JWT completo", "debug-jwt", "", "mt-2 bg-surface-muted text-ink text-xs w-full py-2")}
+        ${button("Ver role do Postgres", "debug-role", "", "mt-2 bg-surface-muted text-ink text-xs w-full py-2")}
+      </div>
+    </div>
+  `;
+}
+
+function screenOnboardingPin() {
+  return `
+    <div class="flex min-h-screen flex-col justify-center gap-6 p-6">
+      <div class="text-center">
+        <h1 class="font-display text-2xl">🔐 Crie o PIN da família</h1>
+        <p class="mt-1 text-sm text-ink-muted">4 a 6 números — protege aprovações e configurações</p>
+      </div>
+      <form id="pin-setup-form" class="mx-auto flex w-full max-w-sm flex-col gap-3" onsubmit="return false">
+        <input name="pin" inputmode="numeric" maxlength="6" required placeholder="••••" class="rounded-card bg-white px-4 py-4 text-center text-2xl tracking-[0.4em]" />
+        <button data-action="set-pin" class="rounded-card bg-xp px-4 py-3 font-medium text-white" ${state.busy ? "disabled" : ""}>Salvar PIN</button>
+      </form>
+    </div>
+  `;
+}
+
+function screenOnboardingChild() {
+  return `
+    <div class="flex min-h-screen flex-col justify-center gap-6 p-6">
+      <div class="text-center">
+        <h1 class="font-display text-2xl">Adicione uma criança</h1>
+        <p class="mt-1 text-sm text-ink-muted">Você pode adicionar mais depois</p>
+      </div>
+      ${addChildForm()}
+      ${state.children.length > 0 ? `<div class="mx-auto">${button("Ir para o painel", "goto-entry", "", "bg-surface-raised")}</div>` : ""}
+    </div>
+  `;
+}
+
+function addChildForm() {
+  return `
+    <form id="child-form" class="mx-auto flex w-full max-w-sm flex-col gap-3" onsubmit="return false">
+      <input name="name" required placeholder="Nome da criança" class="rounded-card bg-white px-4 py-3" />
+      <div class="flex flex-wrap justify-center gap-2" id="avatar-picker">
+        ${AVATARS.map((a, i) => `<button type="button" data-avatar="${a}" class="avatar-option rounded-card bg-surface-raised p-3 text-2xl ${i === 0 ? "ring-2 ring-xp" : ""}">${a}</button>`).join("")}
+      </div>
+      <input type="hidden" name="avatar" value="${AVATARS[0]}" />
+      <button data-action="add-child" class="rounded-card bg-xp px-4 py-3 font-medium text-white" ${state.busy ? "disabled" : ""}>Adicionar</button>
+    </form>
+  `;
+}
+
+function screenEntry() {
+  return `
+    <div class="flex min-h-screen flex-col items-center justify-center gap-8 p-6 text-center">
+      <div>
+        <h1 class="font-display text-3xl">Quem está usando?</h1>
+        <p class="mt-2 text-ink-muted">${state.family?.name || ""}</p>
+      </div>
+      <div class="flex w-full max-w-sm flex-col gap-4">
+        ${button("🔐 Área do Responsável", "goto-parent", "", "bg-surface-raised px-6 py-5 text-lg")}
+        ${button("🎮 Área da Criança", "goto-child-picker", "", "bg-xp text-white px-6 py-5 text-lg")}
+      </div>
+      ${button("Sair da conta", "sign-out", "", "bg-transparent text-sm text-ink-muted underline")}
+    </div>
+  `;
+}
+
+function screenChildPicker() {
+  return `
+    ${topBar("Quem é você?", { back: "goto-entry" })}
+    <div class="grid grid-cols-2 gap-4 p-5">
+      ${state.children.map((c) => `
+        <button data-action="select-child" data-id="${c.id}" class="fade-in flex flex-col items-center gap-2 rounded-card bg-surface-raised p-6 active:scale-95">
+          <span class="text-5xl">${c.avatar_url}</span>
+          <span class="font-medium">${c.name}</span>
+        </button>
+      `).join("")}
+    </div>
+    <div class="px-5">${addChildForm()}</div>
+  `;
+}
+
+function screenChildHome() {
+  const child = state.children.find((c) => c.id === state.selectedChildId);
+  if (!child) { state.screen = "child-picker"; return screenChildPicker(); }
+  const level = levelFromXp(child.current_xp);
+  const nextLevelXp = xpForLevel(level + 1);
+  const currLevelXp = xpForLevel(level);
+  const progress = Math.min(100, Math.round(((child.current_xp - currLevelXp) / (nextLevelXp - currLevelXp || 1)) * 100));
+  const streakPct = Math.min(100, (child.current_streak % 5 || (child.current_streak >= 5 ? 5 : 0)) * 20);
+  const myTasks = state.tasks.filter((t) => t.child_id === child.id && ["pending", "completed_by_child"].includes(t.status));
+  const approvedToday = state.tasks.filter((t) => t.child_id === child.id && t.status === "approved");
+
+  return `
+    ${topBar(child.name, { back: "goto-child-picker" })}
+    <div class="p-5">
+      ${card(`
+        <div class="flex flex-col items-center text-center">
+          <span class="text-6xl">${child.avatar_url}</span>
+          <p class="mt-2 font-display text-2xl">LEVEL ${level}</p>
+          <div class="mt-2 h-3 w-full rounded-pill bg-surface-muted">
+            <div class="h-3 rounded-pill bg-xp" style="width:${progress}%"></div>
+          </div>
+          <p class="mt-1 text-xs text-ink-muted">${child.current_xp} XP</p>
+          <div class="mt-4 flex w-full justify-around">
+            <div><p class="font-display text-points text-2xl">⭐ ${child.current_points}</p><p class="text-xs text-ink-muted">pontos</p></div>
+            <div>
+              <p class="font-display text-streak text-2xl">🔥 ${child.current_streak}</p>
+              <p class="text-xs text-ink-muted">${child.streak_stage === 3 ? "👑 MASTER +10%" : child.streak_stage === 2 ? "Nível 2" : "dias seguidos"}</p>
+            </div>
+          </div>
+        </div>
+      `)}
+
+      <h2 class="mb-2 mt-6 font-display text-lg">🎯 Missões de hoje</h2>
+      ${myTasks.length === 0 ? `<p class="text-sm text-ink-muted">Nenhuma missão pendente. 🎉</p>` : myTasks.map(taskRow).join("")}
+
+      ${approvedToday.length > 0 ? `
+        <h2 class="mb-2 mt-6 font-display text-lg">✅ Concluídas</h2>
+        ${approvedToday.map((t) => card(`<p class="text-sm">${t.icon} ${t.title} <span class="text-ink-muted">— aprovada</span></p>`, "mb-2 opacity-60")).join("")}
+      ` : ""}
+
+      <h2 class="mb-2 mt-6 font-display text-lg">🎁 Prêmios</h2>
+      <div class="grid grid-cols-2 gap-3">
+        ${state.rewards.length === 0 ? `<p class="col-span-2 text-sm text-ink-muted">Nenhum prêmio cadastrado ainda.</p>` : state.rewards.map((r) => rewardCard(r, child)).join("")}
+      </div>
+    </div>
+  `;
+}
+
+function taskRow(task) {
+  const waiting = task.status === "completed_by_child";
+  return card(`
+    <div class="flex items-center justify-between gap-3">
+      <div>
+        <p class="font-medium">${task.icon} ${task.title}</p>
+        <p class="text-xs text-points">+${task.base_points} ⭐</p>
+      </div>
+      ${waiting
+        ? `<span class="rounded-pill bg-surface-muted px-3 py-2 text-xs text-ink-muted">⏳ Aguardando aprovação</span>`
+        : button("Fiz! ✅", "complete-task", task.id, "bg-success text-surface")}
+    </div>
+  `, "mb-3");
+}
+
+function rewardCard(reward, child) {
+  const canAfford = child.current_points >= reward.cost_points;
+  return `
+    <div class="flex flex-col items-center gap-2 rounded-card bg-surface-raised p-4 text-center">
+      <span class="text-3xl">${reward.icon}</span>
+      <p class="text-sm font-medium">${reward.name}</p>
+      <p class="text-xs text-points">${reward.cost_points} ⭐</p>
+      ${canAfford
+        ? button("Resgatar", "redeem-reward", `${child.id}::${reward.id}`, "bg-xp text-white text-sm w-full")
+        : `<span class="text-xs text-ink-muted">Faltam ${reward.cost_points - child.current_points} ⭐</span>`}
+    </div>
+  `;
+}
+
+function screenParentDashboard() {
+  const pendingApprovals = state.tasks.filter((t) => t.status === "completed_by_child");
+  return `
+    ${topBar("Painel da família", { back: "goto-entry", bell: true, signOut: true })}
+    <div class="p-5">
+      <h2 class="mb-2 font-display text-lg">👨‍👩‍👧 Filhos</h2>
+      ${state.children.map((c) => childCard(c)).join('<div class="h-3"></div>')}
+
+      <details class="mt-3">
+        <summary class="cursor-pointer text-sm text-ink-muted">+ Adicionar criança</summary>
+        <div class="mt-3">${addChildForm()}</div>
+      </details>
+
+      <h2 class="mb-2 mt-6 font-display text-lg">⏳ Aprovações pendentes</h2>
+      ${pendingApprovals.length === 0 ? `<p class="text-sm text-ink-muted">Tudo em dia — nenhuma missão aguardando.</p>` : pendingApprovals.map(pendingApprovalRow).join("")}
+
+      <h2 class="mb-2 mt-6 font-display text-lg">🎯 Nova missão</h2>
+      <form id="task-form" class="flex flex-col gap-3" onsubmit="return false">
+        <select name="childId" required class="rounded-card bg-white px-4 py-3">
+          <option value="">Selecione a criança</option>
+          ${state.children.map((c) => `<option value="${c.id}">${c.avatar_url} ${c.name}</option>`).join("")}
+        </select>
+        <input name="title" required placeholder="Título — ex: Lavar prato" class="rounded-card bg-white px-4 py-3" />
+        <div class="flex gap-3">
+          <input name="icon" placeholder="Emoji (opcional)" class="w-24 rounded-card bg-white px-4 py-3" />
+          <input name="basePoints" type="number" min="1" required placeholder="Pontos" class="flex-1 rounded-card bg-white px-4 py-3" />
+        </div>
+        <input name="dueTime" type="time" class="rounded-card bg-white px-4 py-3" />
+        <button data-action="create-task" class="rounded-card bg-xp px-4 py-3 font-medium text-white" ${state.busy ? "disabled" : ""}>Criar missão</button>
+      </form>
+
+      <h2 class="mb-2 mt-6 font-display text-lg">🎁 Loja de recompensas</h2>
+      <form id="reward-form" class="mb-4 flex flex-col gap-3" onsubmit="return false">
+        <input name="name" required placeholder="Nome do prêmio — ex: Sorvete" class="rounded-card bg-white px-4 py-3" />
+        <div class="flex gap-3">
+          <input name="icon" placeholder="Emoji" class="w-24 rounded-card bg-white px-4 py-3" />
+          <input name="costPoints" type="number" min="1" required placeholder="Custo em ⭐" class="flex-1 rounded-card bg-white px-4 py-3" />
+        </div>
+        <button data-action="create-reward" class="rounded-card bg-surface-raised px-4 py-3 font-medium" ${state.busy ? "disabled" : ""}>Adicionar prêmio</button>
+      </form>
+      <div class="grid grid-cols-3 gap-2">
+        ${state.rewards.map((r) => `<div class="rounded-card bg-surface-raised p-3 text-center text-xs"><p class="text-xl">${r.icon}</p>${r.name}<br/><span class="text-points">${r.cost_points}⭐</span></div>`).join("")}
+      </div>
+
+      <h2 class="mb-2 mt-6 font-display text-lg">📦 Resgates para entregar</h2>
+      ${state.redemptions.length === 0 ? `<p class="text-sm text-ink-muted">Nenhum resgate pendente.</p>` : state.redemptions.map(redemptionRow).join("")}
+    </div>
+  `;
+}
+
+// ---------------------------------------------------------------------
+// Render principal
+// ---------------------------------------------------------------------
+function render() {
+  let html;
+  switch (state.screen) {
+    case "loading": html = screenLoading(); break;
+    case "auth": html = screenAuth(); break;
+    case "onboarding-family": html = screenOnboardingFamily(); break;
+    case "onboarding-pin": html = screenOnboardingPin(); break;
+    case "onboarding-child": html = screenOnboardingChild(); break;
+    case "entry": html = screenEntry(); break;
+    case "child-picker": html = screenChildPicker(); break;
+    case "child-home": html = screenChildHome(); break;
+    case "parent": html = screenParentDashboard(); break;
+    default: html = screenLoading();
+  }
+  app.innerHTML = html + pinModal() + notificationsPanel() + toast();
+  attachHandlers();
+}
+
+function attachHandlers() {
+  app.querySelectorAll("[data-action]").forEach((elm) => {
+    elm.addEventListener("click", (e) => {
+      if (elm.dataset.action === "close-modal" || elm.dataset.action === "close-notifications") {
+        if (e.target !== elm) return; // clique dentro do conteúdo não fecha
+      }
+      onAction(elm.dataset.action, elm.dataset.id);
+    });
+  });
+  app.querySelectorAll(".avatar-option").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const form = btn.closest("form");
+      form.querySelector('input[name="avatar"]').value = btn.dataset.avatar;
+      form.querySelectorAll(".avatar-option").forEach((b) => b.classList.remove("ring-2", "ring-xp"));
+      btn.classList.add("ring-2", "ring-xp");
+    });
+  });
+
+  const pinForm = document.getElementById("pin-form");
+  if (pinForm) {
+    pinForm.addEventListener("submit", () => {
+      const pin = new FormData(pinForm).get("pin");
+      if (!pin) return;
+      const { type, id } = state.modal;
+      if (type === "approve") submitApprove({ taskId: id, pin, approve: true });
+      if (type === "reject") submitApprove({ taskId: id, pin, approve: false });
+      if (type === "fulfill") submitFulfill({ redemptionId: id, pin });
+    });
+  }
+}
+
+function onAction(action, id) {
+  const formData = (formId) => new FormData(document.getElementById(formId));
+
+  switch (action) {
+    case "sign-in": {
+      const f = formData("auth-form");
+      if (!f.get("email") || !f.get("password")) { setToast("Preencha e-mail e senha", "error"); break; }
+      handleSignIn(f.get("email"), f.get("password"));
+      break;
+    }
+    case "sign-up": {
+      const f = formData("auth-form");
+      if (!f.get("email") || !f.get("password")) { setToast("Preencha e-mail e senha", "error"); break; }
+      if (f.get("password").length < 8) { setToast("Senha precisa ter 8+ caracteres", "error"); break; }
+      handleSignUp(f.get("email"), f.get("password"));
+      break;
+    }
+    case "sign-out": handleSignOut(); break;
+    case "create-family": {
+      const f = formData("family-form");
+      if (f.get("name")) handleCreateFamily(f.get("name"));
+      break;
+    }
+    case "set-pin": {
+      const f = formData("pin-setup-form");
+      handleSetPin(f.get("pin"));
+      break;
+    }
+    case "add-child": {
+      const f = formData("child-form");
+      if (f.get("name")) handleAddChild(f.get("name"), f.get("avatar"));
+      break;
+    }
+    case "goto-entry": state.screen = "entry"; render(); break;
+    case "goto-parent": state.screen = "parent"; render(); break;
+    case "goto-child-picker": state.screen = "child-picker"; render(); break;
+    case "select-child": state.selectedChildId = id; state.screen = "child-home"; render(); break;
+    case "create-task": {
+      const f = formData("task-form");
+      if (f.get("childId") && f.get("title") && f.get("basePoints")) {
+        handleCreateTask({ childId: f.get("childId"), title: f.get("title"), icon: f.get("icon"), basePoints: f.get("basePoints"), dueTime: f.get("dueTime") });
+      }
+      break;
+    }
+    case "create-reward": {
+      const f = formData("reward-form");
+      if (f.get("name") && f.get("costPoints")) {
+        handleCreateReward({ name: f.get("name"), icon: f.get("icon"), costPoints: f.get("costPoints") });
+      }
+      break;
+    }
+    case "complete-task": handleCompleteTask(id); break;
+    case "redeem-reward": {
+      const [childId, rewardId] = id.split("::");
+      handleRedeemReward(childId, rewardId);
+      break;
+    }
+    case "open-approve": state.modal = { type: "approve", id }; render(); break;
+    case "open-reject": state.modal = { type: "reject", id }; render(); break;
+    case "open-fulfill": state.modal = { type: "fulfill", id }; render(); break;
+    case "close-modal": state.modal = null; render(); break;
+    case "toggle-notifications": state.showNotifications = !state.showNotifications; render(); break;
+    case "close-notifications": state.showNotifications = false; render(); break;
+    case "debug-whoami": {
+      supabase.rpc("debug_whoami").then(({ data, error }) => {
+        if (error) setToast("Erro RPC: " + error.message, "error");
+        else setToast("auth.uid() no servidor: " + (data || "NULL — sessão não chegou"));
+      });
+      break;
+    }
+    case "debug-test-insert": {
+      supabase.rpc("debug_test_insert", { p_name: "Teste Diagnóstico" }).then(({ data, error }) => {
+        if (error) setToast("Erro RPC: " + error.message + " | code:" + (error.code || "?"), "error");
+        else setToast(data, data?.startsWith("OK") ? "info" : "error");
+      });
+      break;
+    }
+    case "debug-jwt": {
+      supabase.rpc("debug_jwt_claims").then(({ data, error }) => {
+        if (error) alert("Erro: " + error.message);
+        else alert("JWT claims:\n" + JSON.stringify(data, null, 2));
+      });
+      break;
+    }
+    case "debug-role": {
+      supabase.rpc("debug_current_role").then(({ data, error }) => {
+        if (error) alert("Erro: " + error.message);
+        else alert(data);
+      });
+      break;
+    }
+  }
+}
+
+// ---------------------------------------------------------------------
+// Boot
+// ---------------------------------------------------------------------
+async function bootstrapSession() {
+  const { data: { session } } = await supabase.auth.getSession();
+  state.session = session;
+  if (!session) { state.screen = "auth"; render(); return; }
+  await loadFamilyData();
+  if (state.family?.pin_hash) subscribeRealtime();
+  render();
+}
+
+if ("serviceWorker" in navigator) {
+  navigator.serviceWorker.register("sw.js").catch(() => {});
+}
+
+bootstrapSession();
+</script>
+</body>
+</html>
